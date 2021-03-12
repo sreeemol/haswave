@@ -1,320 +1,168 @@
-from django.db import transaction
-from django.utils.http import urlsafe_base64_decode
-from django.utils.encoding import force_bytes, force_text
-from django.shortcuts import get_object_or_404
-from django.db.models import Value as V
-from django.db.models.functions import Concat
-from django.db.models import Q
-
-from general.token_generator import account_activation_token, password_reset_token
-
-
-from rest_framework.authtoken.models import Token
-from rest_framework.pagination import PageNumberPagination
 from rest_framework.views import APIView
-from rest_framework.response import Response
-from rest_framework import status
-from rest_framework import generics
-from rest_framework.authentication import TokenAuthentication
-from rest_framework.permissions import IsAuthenticated
-from rest_framework import viewsets
-from rest_framework.decorators import action
+from rest_framework.decorators import api_view
+from django.views.generic import FormView, View
+
+from django.core.exceptions import ObjectDoesNotExist
+
+from Recipe.models import recipe, CartAddedRecipe, RecipeIngredient
+from django.http import HttpResponse
+from django.views.generic import TemplateView, DetailView
+from django.utils.translation import gettext_lazy as _
+
+from catalogue.views import record_aws_event
+from oscar.core.loading import get_class, get_model
+from django.http import HttpResponse
+from oscar.apps.catalogue.models import Product
+from rest_framework.response import Response as APIResponse
+from django.conf import settings
+# from basket.models import Basket
+from oscar.apps.basket.models import Basket, Line
+get_product_search_handler_class = get_class('catalogue.search_handlers', 'get_product_search_handler_class')
 
 
+class RecipeView(TemplateView):
+    context_object_name = "name_recipe"
+    template_name = 'oscar/recipe/browseRecipe.html'
 
-from general.permissions import CustomModelPermissions, IsObjectUser, ListOrCreatePermission
-from .models import Employee, EmployeeScreenshot
-from accounts.serializers import UserSerializer
-from .serializers import EmployeeSerializer, EmployeeLoginSerializer, EmployeeScreenshotSerializer, \
-InviteEmployeeSerializer, EmployeeListSerializer, EmployeePermissionSerializer
-
-from accounts.models import User
-
-
-class StandardResultsSetPagination(PageNumberPagination):
-    page_size = 100
-    page_size_query_param = 'page_size'
-    max_page_size = 1000
+    def get_context_data(self, **kwargs):
+        search_context = {}
+        search_context['summary'] = _("All recipes")
+        search_context['name_recipe'] = recipe.objects.all()
+        search_context['image'] = recipe.objects.all()
+        return search_context
 
 
-class EmployeeViewSet(viewsets.ModelViewSet):
-    """create, update, delete, retirve employees of an organization
+class RecipeAddedCart(APIView):
     """
-    serializer_class = EmployeeSerializer
-    queryset = Employee.objects.all()
-    authentication_classes = [TokenAuthentication]
+    Api to get all the training codes from the training master
+    """
+    def post(self, request, format=None):
+        product_id = request.data.get("recipe_id")
+        quantity = request.data.get("quantity")
+        mode = request.data.get("mode")
+        product = Product.objects.get(id=product_id)
+        response = {}
+        try:
+            obj = CartAddedRecipe.objects.get(recipe_product=product, owner=self.request.user)
+        except CartAddedRecipe.DoesNotExist:
+            obj = None
 
-    # permission_classes = [IsAuthenticated, CustomModelPermissions, 
-    # IsObjectUser, ListOrCreatePermission]
-    
-    permission_classes = [IsAuthenticated,  
-    IsObjectUser, ListOrCreatePermission]
-    
-    lookup_field = 'slug'
-    pagination_class = StandardResultsSetPagination
+        if obj is None:
+            obj = CartAddedRecipe.objects.create(recipe_product=product, owner=self.request.user, quantity=0)
+            obj.save()
 
-    def create(self, request):
-        """Create an employee and send invitation email to 
-        emplyee email address
-        """
-
-        context = { 'request': request }
-
-        user_serializer = UserSerializer(data=request.data)
-        is_valid_user = user_serializer.is_valid()
-
-        serializer = self.get_serializer(data=request.data, context=context)
-        is_valid_serializer = serializer.is_valid()
-
-        invite_serializer = InviteEmployeeSerializer(data=request.data)
-        is_valid_invite = invite_serializer.is_valid()
-
-        if is_valid_user and is_valid_serializer and is_valid_invite:
-            
+        if mode == "add":
+            # event_type = "added_to_cart"
+            # record_aws_event(request.user, product, event_type)
+            quantity_obj = int(obj.quantity) + int(quantity)
+            obj.quantity = quantity_obj
+            obj.save()
             try:
-                with transaction.atomic():
+                basket = Basket.objects.filter(owner = self.request.user).last()
+                for item in Line.objects.filter(basket = basket):
+                    for ingredient in RecipeIngredient.objects.filter(products=product):
+                        if item.product.id == ingredient.ingredient.id:
+                            item.fake_quantity += ingredient.quantity * int(quantity)
+                            item.save()
+            except basket.DoesNotExist:
+                pass
+        if mode == "reduce":
+            quantity_obj = obj.quantity - int(quantity)
+            obj.quantity = quantity_obj
+            obj.save()
 
-                    # creating a user and update is_active filed to false
-                    user = user_serializer.save()
-                    user.is_active = False
-                    user.save()
+            try:
+                basket = Basket.objects.filter(owner = self.request.user).last()
+                for item in Line.objects.filter(basket = basket):
+                    for ingredient in RecipeIngredient.objects.filter(products=product):
+                        if item.product.id == ingredient.ingredient.id:
+                            item.fake_quantity -= ingredient.quantity * int(quantity)
+                            item.save()
+            except basket.DoesNotExist:
+                pass
 
-                    employee = serializer.save(user=user)
-                    invite_serializer.save(employee=employee)
-            except:
-                errors = {
-                    'error': 'Something went wrong, please try again later'
-                }
-                return Response(errors, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+            if quantity_obj <= 0:
+                try:
+                    obj_for_remove = CartAddedRecipe.objects.get(recipe_product=product, owner=self.request.user, quantity=0).delete()
+                    basket = None
+                except CartAddedRecipe.DoesNotExist:
+                    pass
+                #     obj_for_remove = None
+                #
+                # if obj_for_remove is not None:
+                #     del obj_for_remove
 
-            return Response(serializer.data)
 
+        if basket is None:
+            response = {"result": "Quantity updated","status":200}
         else:
-            data = {}
-            data.update(user_serializer.errors)
-            data.update(serializer.errors)
-            data.update(invite_serializer.errors)
+            response = {"result": "Added to cart recipe","status":200}
 
-            return Response(data, status=status.HTTP_400_BAD_REQUEST)
-
-    @action(methods=['post'], detail=False, url_path='organization-employees')
-    def organization_employees(self, request):
-        serializer = EmployeeListSerializer(data=request.data)
-
-        if serializer.is_valid():
-
-            organization_slug = serializer.data.get('organization')
-
-            branch_slug = serializer.data.get('branch')
-            employees = Employee.objects.filter(
-                    organization__slug=organization_slug,user__is_active=True, invitation_accepted=True
-                )
-
-            page = self.paginate_queryset(employees)
-            if page is not None:
-                serializer = self.get_serializer(page, many=True)
-
-                data = {}
-
-                page_nated_data = self.get_paginated_response(serializer.data).data
-                data.update(page_nated_data)
-                data['response'] = data.pop('results')
-
-                return Response(data)
-
-            serializer = self.get_serializer(employees, many=True)
-            return Response(serializer.data)
-        else:
-            return Response(serializer.errors)
-
-    @action(methods=['get'], detail=True, url_path='list-employee-permissions')
-    def list_employee_permissions(self, request, slug=None):
-        
-        employee = self.get_object()
-
-        serializer = EmployeePermissionSerializer(employee)
-
-        return Response(serializer.data)
-    
-    
-
-    @action(methods=['post'], detail=True, url_path='employee-permissions')
-    def employee_permissions(self, request, slug=None):
-        employee = self.get_object()
-
-        serializer = EmployeePermissionSerializer(employee, data=request.data)
-
-        if serializer.is_valid():
-            serializer.save()
-            
-            return Response(serializer.data)
-        else:
-            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
-
-    @action(methods=['post'], detail=True, url_path='employee-status-change')
-    def employee_status_change(self, request, slug=None):
-
-        employee = self.get_object()
-        if employee.employee_status == 'Active':
-            employee.user.is_active = False
-            employee.user.save()
-
-        else:
-            employee.user.is_active = True
-            employee.user.save()
-
-        return Response({'status': 'success'})
+        return APIResponse(response)
 
 
-class EmployeeAPILogin(APIView):
-    """Employee Login API view
-    Returns user id, email, and authentication token
-    """
-    def post(self, request):
+class RecipeRemoveCart(APIView):
 
-        serializer = EmployeeLoginSerializer(data=request.data)
+    def post(self, request, format=None):
+        response = {}
+        product_id = request.data.get("recipe_id")
+        product = Product.objects.get(id=product_id)
+        try:
+            obj = CartAddedRecipe.objects.filter(recipe_product=product, owner=self.request.user)
+            obj.delete()
+            response = {"result": "Recipe removed from recipe cart", "status": 200}
+        except obj.DoesNotExist:
+            response = {"result": "Object does not exist" , "status": 500}
 
-        if serializer.is_valid():
-            user = serializer.validated_data['user']
-            token, created = Token.objects.get_or_create(user=user)
-
-            return Response({
-                'token': token.key,
-                'slug': user.employee_user.slug,
-                'email': user.email
-            })
-
-        else:
-            return Response(
-                serializer.errors,
-                status=status.HTTP_400_BAD_REQUEST)
+        return APIResponse(response)
 
 
-class EmployeeScreenshotCreateAPIView(generics.CreateAPIView):
-    """API view to create new screenshort instance in database
-    input fields are employee slug, screenshort, datetime
-    """
-    permission_classes = (IsAuthenticated,)
-    authentication_classes = (TokenAuthentication,)
-    serializer_class = EmployeeScreenshotSerializer
+class GetRecipeDetails(APIView):
+
+    def post(self, request, format=None):
+        response = {}
+
+        product_id = request.data.get("recipe_id")
+        product = Product.objects.get(id=product_id)
+        ctx= {}
+        outer_list = []
+        try:
+            ingredients = RecipeIngredient.objects.filter(products=product)
+            for product in ingredients:
+
+                inner_list = {}
+                inner_list['id'] = product.ingredient.id
+                inner_list['quantity'] = product.quantity
+                outer_list.append(inner_list)
+            ctx['ingredients'] = outer_list
+            ctx['recipe_id'] = product_id
+
+            response = {"result": ctx, "status": 200}
+
+        except ingredients.DoesNotExist:
+            response = {"result": "Object does not exist" , "status": 500}
+
+        return APIResponse(response)
 
 
-class EmployeeEmailVerificationView(APIView):
-    """ Confirming registration via link provided in email"""
+class BasketTotal(APIView):
 
-    def get(self, request, *args, **kwargs):
-        """ Ckecking token and conforming account activation"""
-        pk = force_text(urlsafe_base64_decode( kwargs.get('uidb64')))
-        token = kwargs.get('token')
-        
-        user = get_object_or_404(User, pk=pk)
-        
-        if account_activation_token.check_token(user, token):
+    def get(self, request):
+        response = {}
+        total_incl_tax = 0
+        total_excl_tax = 0
+        curency = ''
+        try:
+            basket = Basket.objects.filter(owner = self.request.user).last()
+            for item in Line.objects.filter(basket = basket):
+                total_excl_tax += item.price_excl_tax * item.quantity
+                # total_incl_tax += item.total_incl_tax * item.quantity
+                # curency = item.currency
+            response['total_excl_tax'] = total_excl_tax
+            response['item_count'] = basket.num_lines
+            # response['total_incl_tax'] = total_incl_tax
+            # response['currency'] = curency
+        except Basket.DoesNotExist:
+            response = {"total": 0 , "currency": "None"}
 
-            request.session.flush()
-            
-            user.is_active = True
-            employee_obj = user.employee_user.first()
-            employee_obj.invitation_accepted = True
-            employee_obj.save()
-            user.save()
-
-            token, created = Token.objects.get_or_create(user=user)
-
-            data = {
-                'status': 'success',
-                'profile_slug': user.employee_user.first().slug,
-                'email': user.email,
-                'token': token.key,
-                'message': 'email verificaton successfull'
-            }
-
-            return Response(data, status=status.HTTP_200_OK)
-
-        else:
-            data = {
-                'status': 'error',
-                'message': 'Invalid verification link'
-            }
-
-            return Response(data, status=status.HTTP_400_BAD_REQUEST)
-
-
-class EmployeesSearchViewSet(viewsets.ModelViewSet):
-    """search and filtering employees of an organization ,branch,department
-    """
-    serializer_class = EmployeeListSerializer
-    queryset = Employee.objects.all()
-    authentication_classes = [TokenAuthentication]
-    permission_classes = [IsAuthenticated, CustomModelPermissions, IsObjectUser, ListOrCreatePermission]
-    lookup_field = 'slug'
-    pagination_class = StandardResultsSetPagination
-
-    # def list(self, request):
-    #     data = {'detail': 'Not found'}
-    #     return Response(data, status=status.HTTP_404_NOT_FOUND)
-
-    @action(methods=['post'], detail=False, url_path='organization-employees')
-    def organization_employees(self, request):
-
-        serializer = EmployeeListSerializer(data=request.data)
-
-        if serializer.is_valid():
-
-            queryset = self.get_queryset()
-
-            organization_slug = serializer.data.get('organization')
-
-            queryset = queryset.filter(organization__slug=organization_slug)
-
-            status = self.request.POST.get('status', None)
-
-            if status == 'inactive':
-                queryset = queryset.filter(user__is_active=False, invitation_accepted=True)
-
-            elif status == 'invited':
-                queryset = queryset.filter(invitation_accepted=False)
-            else:
-                queryset = queryset.filter(user__is_active=True, invitation_accepted=True)
-
-            listing = self.request.POST.get('listing', None)
-
-            if listing == 'branches':
-                queryset = queryset.filter(branch__isnull=False)
-
-            if listing == 'general':
-                queryset = queryset.filter(organization__isnull=False, branch__isnull=True)
-
-            branch_slug = self.request.POST.get('branch', None)
-
-            if branch_slug:
-                queryset = queryset.filter(branch__slug=branch_slug)
-
-            q = self.request.POST.get('q', None)
-
-            if q:
-                queryset = queryset.annotate(
-                    search=Concat('first_name', V(' '), 'last_name')
-                ).filter(Q(search__icontains=q) | Q(user__email__icontains=q))
-
-            department_slug = self.request.POST.get('department', None)
-            if department_slug:
-                queryset = queryset.filter(department__slug=department_slug)
-
-            page = self.paginate_queryset(queryset)
-            if page is not None:
-                serializer = EmployeeSerializer(page, many=True)
-
-                data = {}
-
-                page_nated_data = self.get_paginated_response(serializer.data).data
-                data.update(page_nated_data)
-                data['response'] = data.pop('results')
-
-                return Response(data)
-
-            serializer = EmployeeSerializer(queryset, many=True)
-
-            return Response(serializer.data)
-        else:
-            return Response(serializer.errors)
+        return APIResponse(response)
